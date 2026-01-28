@@ -1,0 +1,11 @@
+# Directories to ignore
+datasetRIS/
+datasetRIS_32x32/
+datasetRISNewCorrected/
+inference_predictions/
+inference_predictions_new/
+eval_imgs/
+eval_imgs_1/
+PMNet_results/inference_images/
+pmnet/
+__pycache__/
