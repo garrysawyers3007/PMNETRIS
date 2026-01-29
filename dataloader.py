@@ -60,7 +60,7 @@ class PMnet_data_usc(Dataset):
         for record_idx, record in enumerate(original_records):
             paths_dict = record.get("paths")
             if not isinstance(paths_dict, dict) or \
-               not all(k in paths_dict for k in ["city_map", "tx_map", "power_map"]):
+               not all(k in paths_dict for k in ["city_map", "tx_map", "power_map", "rx_map"]):
                 print(f"Warning: Record {record_idx} has missing or malformed 'paths' dictionary. Skipping this record.")
                 continue
 
@@ -83,6 +83,7 @@ class PMnet_data_usc(Dataset):
                     "type": record.get("type"),
                     "city_map_path": paths_dict["city_map"][i],
                     "tx_map_path": paths_dict["tx_map"][i],
+                    "rx_map_path": paths_dict["rx_map"][i],
                     "power_map_path": paths_dict["power_map"][i],
                     "is_ris_present_flag": 0.0,
                     "ris_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
@@ -135,6 +136,10 @@ class PMnet_data_usc(Dataset):
             if image_tx.ndim == 3 and image_tx.shape[-1] >= 3:
                 image_tx = image_tx[:,:,0]
 
+            image_rx = np.asarray(io.imread(data_point["rx_map_path"])) 
+            if image_rx.ndim == 3 and image_rx.shape[-1] >= 3:
+                image_rx = image_rx[:,:,0]
+
             image_power = np.asarray(io.imread(data_point["power_map_path"]))
             if image_power.ndim == 3 and image_power.shape[-1] >= 3:
                 image_power = image_power[:,:,0]
@@ -146,8 +151,9 @@ class PMnet_data_usc(Dataset):
 
         if image_buildings.ndim != 2: raise ValueError(f"Building map for data_point {idx} is not 2D after processing.")
         if image_tx.ndim != 2: raise ValueError(f"TX map for data_point {idx} is not 2D after processing.")
+        if image_rx.ndim != 2: raise ValueError(f"RX map for data_point {idx} is not 2D after processing.")
         
-        inputs_np = np.stack([image_buildings, image_tx], axis=-1) 
+        inputs_np = np.stack([image_buildings, image_tx, image_rx], axis=-1) 
 
         # Construct ris_info_tensor from pre-processed data_point fields
         ris_info_list = list(data_point["ris_pos_normalized"]) + \

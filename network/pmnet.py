@@ -247,6 +247,121 @@ class PMNetFiLM(nn.Module):
         return xup00
     
 
+class PMNetFiLMNew(nn.Module):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=8):
+        super(PMNetFiLMNew, self).__init__()
+
+        # --- Stride Config ---
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+
+        # --- Encoder Configuration ---
+        # ch = [64, 128, 256, 512, 1024, 2048]
+        ch = [64 * 2 ** p for p in range(6)]
+        
+        self.layer1 = _Stem(ch[0], in_ch=3)  # Output: 64 channels (x1)
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0]) # Output: 256 channels (x2)
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1) # Output: 256 channels (x3)
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1]) # Output: 512 channels (x4)
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2]) # Output: 512 channels (x5)
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids) # Output: 1024 channels (x6)
+        
+        self.aspp = _ASPP(ch[4], 256, atrous_rates) # Output: 256 channels (x7)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1) # Output: 512 channels (x8)
+
+        # --- Decoder Configuration (Fixed Channels) ---
+        
+        # Block 5: Inputs x8 (512)
+        self.conv_up5 = ConRu(512, 512, 3, 1) 
+        
+        # Block 4: Inputs xup5 (512) + x5 (512) = 1024
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1) 
+        
+        # Block 3: Inputs xup4 (512) + x4 (512) = 1024
+        self.conv_up3 = ConRu(512 + 512, 256, 3, 1) 
+        
+        # Block 2: Inputs xup3 (256) + x3 (256) = 512
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1) 
+        
+        # Block 1: Inputs xup2 (256) + x2 (256) = 512
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        
+        # Block 0: Inputs xup1 (256) + x1 (64) = 320
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+
+        # Final Block: Inputs xup0 (128) + Original Image (3) = 131
+        self.conv_up00 = nn.Sequential(
+            nn.Conv2d(128 + 3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x, vec):
+        # Encoder
+        x1 = self.layer1(x)       # [B, 64, H/2, W/2]
+        x2 = self.layer2(x1)      # [B, 256, H/4, W/4]
+        x3 = self.reduce(x2)      # [B, 256, H/4, W/4]
+        x4 = self.layer3(x3)      # [B, 512, H/8, W/8]
+        x5 = self.layer4(x4)      # [B, 512, H/8, W/8] (if stride=1)
+        x6 = self.layer5(x5)      # [B, 1024, H/8, W/8]
+        x7 = self.aspp(x6)        # [B, 256, H/8, W/8]
+        x8 = self.fc1(x7)         # [B, 512, H/8, W/8]
+
+        # FiLM
+        cond_out = self.conditioner(vec)
+        x8 = self.film(x8, cond_out)
+
+        # Decoder (with Robust Interpolation)
+        xup5 = self.conv_up5(x8)
+        if xup5.shape[2:] != x5.shape[2:]:
+            xup5 = F.interpolate(xup5, size=x5.shape[2:], mode='bilinear', align_corners=False)
+        xup5 = torch.cat([xup5, x5], dim=1) # 512+512 = 1024
+
+        xup4 = self.conv_up4(xup5)
+        if xup4.shape[2:] != x4.shape[2:]:
+            xup4 = F.interpolate(xup4, size=x4.shape[2:], mode='bilinear', align_corners=False)
+        xup4 = torch.cat([xup4, x4], dim=1) # 512+512 = 1024
+
+        xup3 = self.conv_up3(xup4)
+        if xup3.shape[2:] != x3.shape[2:]:
+            xup3 = F.interpolate(xup3, size=x3.shape[2:], mode='bilinear', align_corners=False)
+        xup3 = torch.cat([xup3, x3], dim=1) # 256+256 = 512
+
+        xup2 = self.conv_up2(xup3)
+        if xup2.shape[2:] != x2.shape[2:]:
+            xup2 = F.interpolate(xup2, size=x2.shape[2:], mode='bilinear', align_corners=False)
+        xup2 = torch.cat([xup2, x2], dim=1) # 256+256 = 512
+
+        xup1 = self.conv_up1(xup2)
+        if xup1.shape[2:] != x1.shape[2:]:
+            xup1 = F.interpolate(xup1, size=x1.shape[2:], mode='bilinear', align_corners=False)
+        xup1 = torch.cat([xup1, x1], dim=1) # 256+64 = 320
+
+        xup0 = self.conv_up0(xup1) # Output 128
+
+        # Force 10x10 Output
+        target_size = (10, 10)
+        xup0 = F.interpolate(xup0, size=target_size, mode="bilinear", align_corners=False)
+        x_resized = F.interpolate(x, size=target_size, mode="bilinear", align_corners=False)
+        
+        xup0 = torch.cat([xup0, x_resized], dim=1) # 128+3 = 131
+        xup00 = self.conv_up00(xup0)
+
+        return xup00
+    
+
 class PMNet(nn.Module):
 
     def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride):
