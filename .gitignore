@@ -1,5 +1,6 @@
 # Directories to ignore
 datasetRIS/
+datasetGeoRIS/
 datasetRIS_32x32/
 datasetRISNewCorrected/
 inference_predictions/

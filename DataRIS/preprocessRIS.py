@@ -7,14 +7,15 @@ import json
 
 # Define constants (adjust as needed)
 ROOT = "DataRIS/"
-OUTPUT_ROOT = "datasetRIS_32x32/"
+OUTPUT_ROOT = "datasetGeoRIS/"
 TX_POS_FILE = f"{ROOT}tx_positions.npy"
 SCENE_FILE = f"{ROOT}USC_3D/USC.xml"
 CITY_MAP_FILE = f"{ROOT}USC_city_map.png"
-JSON_INPUT_FILE = "dataset_32x32.json"
+JSON_INPUT_FILE = "dataset_new_32x32.json"
 JSON_OUTPUT_FILE = f"{OUTPUT_ROOT}metadata.json"
 
 CM_DIM = 900  # Coverage map dimension (pixels)
+NEW_CM_DIM = 10
 CM_CELL_SIZE = (5.0, 5.0) # Cell size in meters
 TX_WIDTH = 8  # TX marker width in pixels
 FLOOR = -200 # Min power value (dB)
@@ -135,7 +136,7 @@ def augment_position_ordered(world_xyz_array):
 
 def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map_img,
                           output_folder_path, file_prefix_str, metadata_list_ref,
-                          is_ris_scenario=False, ris_info_dict=None):
+                          is_ris_scenario=False, ris_info_dict=None, rx_center=None):
     """Generates, processes, flips, and saves maps, updating metadata."""
     print(f"  Generating coverage map for {file_prefix_str}...")
     if not scene_to_use.rx_array:
@@ -149,25 +150,33 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
         coverage_map_params["ris"] = True
         coverage_map_params["max_depth"] = 1000
         coverage_map_params["num_samples"] = int(2*(10**6))
+        coverage_map_params["cm_center"] = ris_info_dict["rx_pos_for_steering"]
+        coverage_map_params["cm_size"] = [50, 50]
+        coverage_map_params["cm_orientation"] = [0, 0, 0]
     else:
         coverage_map_params["max_depth"] = 1000 # Default for non-RIS
         coverage_map_params["num_samples"] = int(2*(10**6)) # Default for non-RIS
+        if rx_center is not None:
+            coverage_map_params["cm_center"] = rx_center
+            coverage_map_params["cm_size"] = [50, 50]
+            coverage_map_params["cm_orientation"] = [0, 0, 0]
 
     cm = scene_to_use.coverage_map(**coverage_map_params)
     if cm.path_gain.shape[0] == 0:
         print(f"  Warning: No path gain data for {file_prefix_str}. Saving blank power map.")
-        tx_cm_processed = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
+        tx_cm_processed = np.zeros((NEW_CM_DIM, NEW_CM_DIM), dtype=np.uint8)
     else:
         tx_cm = 10.*np.log10(cm.path_gain[0].numpy())
+        
         tx_cm[tx_cm==(-np.inf)] = -255
         tx_cm[tx_cm > 0] = 0
-        tx_cm = cv2.resize(tx_cm, city_map_img.shape)
+        # tx_cm = cv2.resize(tx_cm, city_map_img.shape)
 
-        tx_cm = cv2.flip(tx_cm, 0)
+        # tx_cm = cv2.flip(tx_cm, 0)
         tx_cm[tx_cm < FLOOR] = FLOOR
         tx_cm += 255
 
-        tx_cm[city_map_img < 55] = 0 # for building
+        # tx_cm[city_map_img < 55] = 0 # for building
         
         # tx_cm_raw = 10. * np.log10(cm.path_gain[0].numpy())
         # tx_cm_raw[tx_cm_raw==(-np.inf)] = -255
@@ -189,7 +198,24 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
     x_start = np.clip(tx_pos_2d_map[0] - shift, 0, CM_DIM); x_end = np.clip(tx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
     tx_map_img[y_start:y_end, x_start:x_end] = 255
 
-    maps_to_save_dict = {"tx_map": tx_map_img.copy(), "power_map": tx_cm_processed.copy(), "city_map": city_map_img.copy()}
+    # Create RX map (for both RIS and non-RIS scenarios)
+    rx_map_img = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
+    if is_ris_scenario and ris_info_dict:
+        rx_pos_3d = np.array(ris_info_dict["rx_pos_for_steering"])
+        rx_pos_2d_map = (rx_pos_3d[:2] + (CM_DIM // 2) + (50)).astype(np.int16)
+        map_y_center_rx = CM_DIM - rx_pos_2d_map[1]
+        y_start_rx = np.clip(map_y_center_rx - shift, 0, CM_DIM); y_end_rx = np.clip(map_y_center_rx + shift + 1, 0, CM_DIM)
+        x_start_rx = np.clip(rx_pos_2d_map[0] - shift, 0, CM_DIM); x_end_rx = np.clip(rx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
+        rx_map_img[y_start_rx:y_end_rx, x_start_rx:x_end_rx] = 255
+    elif not is_ris_scenario and rx_center is not None:
+        rx_pos_3d = np.array(rx_center)
+        rx_pos_2d_map = (rx_pos_3d[:2] + (CM_DIM // 2) + (50)).astype(np.int16)
+        map_y_center_rx = CM_DIM - rx_pos_2d_map[1]
+        y_start_rx = np.clip(map_y_center_rx - shift, 0, CM_DIM); y_end_rx = np.clip(map_y_center_rx + shift + 1, 0, CM_DIM)
+        x_start_rx = np.clip(rx_pos_2d_map[0] - shift, 0, CM_DIM); x_end_rx = np.clip(rx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
+        rx_map_img[y_start_rx:y_end_rx, x_start_rx:x_end_rx] = 255
+
+    maps_to_save_dict = {"tx_map": tx_map_img.copy(), "rx_map": rx_map_img.copy(), "power_map": tx_cm_processed.copy(), "city_map": city_map_img.copy()}
     paths_data_dict = {}
 
     for map_type_str, map_image_data in maps_to_save_dict.items():
@@ -249,19 +275,30 @@ def main():
             print(f"  Warning: TX_ID {current_tx_id_int} out of bounds. Skipping."); continue
 
         current_tx_pos = tx_positions_all[current_tx_id_int]
+        print(f"  TX Position: {current_tx_pos}")
         current_tx_pos_3d_scene = np.array([current_tx_pos[0], current_tx_pos[1], current_tx_pos[2]])
         tx_specific_output_folder = os.path.join(OUTPUT_ROOT, current_tx_id_str)
         os.makedirs(tx_specific_output_folder, exist_ok=True)
 
         # --- No RIS Case ---
-        print("  Processing 'no RIS' case...")
-        scene_no_ris = get_scene(SCENE_FILE)
-        tx_obj_name_no_ris = f"tx{current_tx_id_str}_no_ris"
-        transmitter_no_ris = Transmitter(tx_obj_name_no_ris, current_tx_pos_3d_scene + [0.0, 0.0, 2.0], [0.0, 0.0, 0.0])
-        scene_no_ris.add(transmitter_no_ris)
-        process_and_save_maps(scene_no_ris, current_tx_id_str, current_tx_pos, city_map_resized,
-                              tx_specific_output_folder, f"{current_tx_id_str}_noRIS", metadata_collector,
-                              is_ris_scenario=False)
+        print("  Processing 'no RIS' cases...")
+        # Extract unique RX positions from records
+        unique_rx_positions = {}
+        for i, record_item in enumerate(tx_entry_item["records"]):
+            rx_pos = tuple(record_item["RX"])  # Use tuple as dict key
+            if rx_pos not in unique_rx_positions:
+                unique_rx_positions[rx_pos] = i
+        
+        # Generate no-RIS maps for each unique RX position
+        for rx_idx, (rx_pos_tuple, record_idx) in enumerate(unique_rx_positions.items()):
+            rx_pos_list = list(rx_pos_tuple)
+            scene_no_ris = get_scene(SCENE_FILE)
+            tx_obj_name_no_ris = f"tx{current_tx_id_str}_no_ris_rx{rx_idx}"
+            transmitter_no_ris = Transmitter(tx_obj_name_no_ris, current_tx_pos_3d_scene + [0.0, 0.0, 2.0], [0.0, 0.0, 0.0])
+            scene_no_ris.add(transmitter_no_ris)
+            process_and_save_maps(scene_no_ris, current_tx_id_str, current_tx_pos, city_map_resized,
+                                  tx_specific_output_folder, f"{current_tx_id_str}_noRIS_rx{rx_idx}", metadata_collector,
+                                  is_ris_scenario=False, rx_center=rx_pos_list)
 
         # --- RIS Cases ---
         print(f"  Processing {len(tx_entry_item['records'])} RIS cases for TX_ID {current_tx_id_str}...")
