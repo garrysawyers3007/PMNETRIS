@@ -172,7 +172,7 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
         tx_cm[tx_cm > 0] = 0
         # tx_cm = cv2.resize(tx_cm, city_map_img.shape)
 
-        # tx_cm = cv2.flip(tx_cm, 0)
+        tx_cm = cv2.flip(tx_cm, 0)
         tx_cm[tx_cm < FLOOR] = FLOOR
         tx_cm += 255
 
