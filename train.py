@@ -28,7 +28,8 @@ from torchsummary import summary as summary_
 import cv2
 
 from network.pmnet import PMNet, PMNetFiLM
-from config import config_USC_pmnetV3_V2
+from network.rismapnet import RISMapNet, RISMapNetConfig
+from config import config_USC_pmnetV3_V2, config_USC_RISMapNet_V1
 from dataloader import PMnet_data_usc
 from loss import L1_loss, MSE, RMSE, WeightedRMSELoss
 
@@ -69,10 +70,12 @@ def train(model, train_loader, test_loader, optimizer, scheduler, writer, cfg=No
             ris_params = ris_params.cuda()
             targets = targets.cuda()
             rx_params = ris_params[:, 6:9]
+            # Clip ris_params to exclude RX position (keep RIS pos, orientation, and flag)
+            ris_params_clipped = torch.cat([ris_params[:, :6], ris_params[:, 9:10]], dim=1)
 
             optimizer.zero_grad()
             # preds = model(inputs)
-            preds = model(inputs, ris_params)
+            preds = model(inputs, ris_params_clipped)
             loss = RMSE(preds, targets)
             # loss = weightedRMSE(preds, targets, rx_params)
 
@@ -107,7 +110,8 @@ def eval_model(model, test_loader, error="RMSE", best_val=100, cfg=None, eval_mo
         inputs = inputs.cuda()
         ris_params = ris_params.cuda()
         targets = targets.cuda()
-
+        # Clip ris_params to exclude RX position (keep RIS pos, orientation, and flag)
+        ris_params_clipped = torch.cat([ris_params[:, :6], ris_params[:, 9:10]], dim=1)
 
         with torch.set_grad_enabled(False):
             if error == "MSE":
@@ -118,7 +122,7 @@ def eval_model(model, test_loader, error="RMSE", best_val=100, cfg=None, eval_mo
                 criterion = L1_loss
 
             # preds = model(inputs)
-            preds = model(inputs, ris_params)
+            preds = model(inputs, ris_params_clipped)
             preds = torch.clip(preds, 0, 1)
 
             # inference image
@@ -182,12 +186,22 @@ def helper(cfg, writer, data_root = '', load_model=''):
 
 
     # init model
-    model = PMNetFiLM(
-        n_blocks=[3, 3, 27, 3],
-        atrous_rates=[6, 12, 18],
-        multi_grids=[1, 2, 4],
-        output_stride=8,
-        cond_features=10)
+    model_cfg = RISMapNetConfig(
+            base_channels=32,
+            channel_mults=(1, 2, 4, 8, 8),  # 32,64,128,256,256
+            blocks_per_stage=1,
+            film_hidden=128,
+            dropout=0.05,
+            use_coordconv=True,
+            use_dilated_block_at_16=True,
+        )
+    model = RISMapNet(cond_dim=7, cfg=model_cfg)
+    # model = PMNetFiLM(
+    #     n_blocks=[3, 3, 27, 3],
+    #     atrous_rates=[6, 12, 18],
+    #     multi_grids=[1, 2, 4],
+    #     output_stride=8,
+    #     cond_features=10)
     # model = PMNet(
     #     n_blocks=[3, 3, 27, 3],
     #     atrous_rates=[6, 12, 18],
@@ -217,12 +231,13 @@ if __name__ == "__main__":
     split_to_eval_score_dict = {}
 
     data_root = "datasetRIS_32x32/"  # Change this to your dataset directory
-    RESULT_FOLDER = f'{data_root}PMNet_results_32x32/'
+    RESULT_FOLDER = f'{data_root}RISMapNet_results_32x32/'
     set_seed(1234)  # Set a random seed for reproducibility
     TENSORBOARD_PREFIX = f'{RESULT_FOLDER}augmented_runCompare'
 
     print('start')
-    cfg = config_USC_pmnetV3_V2()
+    # cfg = config_USC_pmnetV3_V2()
+    cfg = config_USC_RISMapNet_V1()
     cfg.now = datetime.today().strftime("%Y%m%d%H%M") # YYYYmmddHHMM
 
 

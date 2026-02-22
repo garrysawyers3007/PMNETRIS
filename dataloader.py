@@ -169,9 +169,9 @@ class PMnet_data_usc(Dataset):
             inputs_tensor = self.transform(inputs_np).type(torch.float32)
             
             if power_tensor_np.dtype == np.uint8:
-                power_tensor = self.transform(power_tensor_np).type(torch.float32)
+                power_tensor = transforms.ToTensor()(power_tensor_np).type(torch.float32)
             else: 
-                power_tensor = self.transform(power_tensor_np.astype(np.uint8)).type(torch.float32)
+                power_tensor = transforms.ToTensor()(power_tensor_np.astype(np.uint8)).type(torch.float32)
 
         if self.get_paths:
             return inputs_tensor, ris_info_tensor, power_tensor, data_point["city_map_path"], data_point["tx_map_path"], data_point["power_map_path"]

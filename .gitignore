@@ -4,6 +4,7 @@ datasetGeoRIS/
 datasetRIS_32x32/
 datasetRISNewCorrected/
 inference_predictions/
+inference_predictions_1/
 inference_predictions_new/
 eval_imgs/
 eval_imgs_1/
