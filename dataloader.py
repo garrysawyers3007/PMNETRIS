@@ -88,13 +88,17 @@ class PMnet_data_usc(Dataset):
                     "is_ris_present_flag": 0.0,
                     "ris_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
                     "ris_orientation_rpy_for_view": np.zeros(3, dtype=np.float32), # Default for noRIS
-                    "rx_pos_normalized": np.zeros(3, dtype=np.float32) # Default for noRIS
+                    "rx_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
+                    "ris_pos_polar": np.zeros(9, dtype=np.float32), # Default for noRIS: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
+                    "ris_pos_rho_theta_phi": np.zeros(7, dtype=np.float32) # Default for noRIS: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
                 }
 
                 if record.get("type") == "RIS":
                     augmented_positions = record.get("ris_positions_xyz_augmented_for_view")
                     augmented_rx_positions = record.get("rx_positions_xyz_augmented_for_view")
                     augmented_orientations = record.get("orientations_rpy_augmented_for_view")
+                    augmented_polar_positions = record.get("ris_positions_polar_augmented_for_view")
+                    augmented_rho_theta_phi_positions = record.get("ris_positions_rho_theta_phi_augmented_for_view")
 
                     if isinstance(augmented_positions, list) and len(augmented_positions) > i and \
                         isinstance(augmented_orientations, list) and len(augmented_orientations) > i:
@@ -115,6 +119,32 @@ class PMnet_data_usc(Dataset):
                             data_point["is_ris_present_flag"] = 1.0
                         else:
                             print(f"Warning: Malformed position/orientation for view {i} in RIS record {record_idx}. Treating as noRIS.")
+
+                        # Polar coordinates: [rho, sin_theta, cos_theta, sin_phi, cos_phi]
+                        if isinstance(augmented_polar_positions, list) and len(augmented_polar_positions) > i:
+                            specific_polar = augmented_polar_positions[i]
+                            if isinstance(specific_polar, list) and len(specific_polar) == 5:
+                                data_point["ris_pos_polar"] = np.array(
+                                    [specific_polar[0] / 400.0] + specific_polar[1:] + list(specific_orientation) + [1.0],
+                                    dtype=np.float32
+                                )
+                            else:
+                                print(f"Warning: Malformed polar position for view {i} in RIS record {record_idx}. Using zeros.")
+                        else:
+                            print(f"Warning: Missing polar positions for view {i} in RIS record {record_idx}. Using zeros.")
+
+                        # Raw rho/theta/phi tensor: [rho/400, theta, phi, roll, pitch, yaw, flag]
+                        if isinstance(augmented_rho_theta_phi_positions, list) and len(augmented_rho_theta_phi_positions) > i:
+                            specific_rtp = augmented_rho_theta_phi_positions[i]
+                            if isinstance(specific_rtp, list) and len(specific_rtp) == 3:
+                                data_point["ris_pos_rho_theta_phi"] = np.array(
+                                    [specific_rtp[0] / 400.0] + specific_rtp[1:] + list(specific_orientation) + [1.0],
+                                    dtype=np.float32
+                                )
+                            else:
+                                print(f"Warning: Malformed rho/theta/phi position for view {i} in RIS record {record_idx}. Using zeros.")
+                        else:
+                            print(f"Warning: Missing rho/theta/phi positions for view {i} in RIS record {record_idx}. Using zeros.")
 
                         data_point["is_ris_present_flag"] = 1.0
                     else:
@@ -161,6 +191,12 @@ class PMnet_data_usc(Dataset):
                         list(data_point["rx_pos_normalized"]) + \
                         [data_point["is_ris_present_flag"]]
         ris_info_tensor = torch.tensor(ris_info_list, dtype=torch.float32)
+
+        # Polar coords tensor: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
+        ris_polar_tensor = torch.tensor(data_point["ris_pos_polar"], dtype=torch.float32)
+
+        # Raw rho/theta/phi tensor: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
+        ris_rho_theta_phi_tensor = torch.tensor(data_point["ris_pos_rho_theta_phi"], dtype=torch.float32)
         
         inputs_tensor = inputs_np 
         power_tensor_np = image_power 
@@ -174,9 +210,9 @@ class PMnet_data_usc(Dataset):
                 power_tensor = transforms.ToTensor()(power_tensor_np.astype(np.uint8)).type(torch.float32)
 
         if self.get_paths:
-            return inputs_tensor, ris_info_tensor, power_tensor, data_point["city_map_path"], data_point["tx_map_path"], data_point["power_map_path"]
+            return inputs_tensor, ris_info_tensor, ris_polar_tensor, ris_rho_theta_phi_tensor, power_tensor, data_point["city_map_path"], data_point["tx_map_path"], data_point["power_map_path"]
             
-        return inputs_tensor, ris_info_tensor, power_tensor
+        return inputs_tensor, ris_info_tensor, ris_polar_tensor, ris_rho_theta_phi_tensor, power_tensor
     
 # if __name__ == "__main__":
 #     # Example usage

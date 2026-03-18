@@ -215,7 +215,17 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
         x_start_rx = np.clip(rx_pos_2d_map[0] - shift, 0, CM_DIM); x_end_rx = np.clip(rx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
         rx_map_img[y_start_rx:y_end_rx, x_start_rx:x_end_rx] = 255
 
-    maps_to_save_dict = {"tx_map": tx_map_img.copy(), "rx_map": rx_map_img.copy(), "power_map": tx_cm_processed.copy(), "city_map": city_map_img.copy()}
+    # Create RIS map (RIS scenario only; blank for noRIS)
+    ris_map_img = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
+    if is_ris_scenario and ris_info_dict:
+        ris_pos_3d = np.array(ris_info_dict["ris_pos"])
+        ris_pos_2d_map = (ris_pos_3d[:2] + (CM_DIM // 2) + (50)).astype(np.int16)
+        map_y_center_ris = CM_DIM - ris_pos_2d_map[1]
+        y_start_ris = np.clip(map_y_center_ris - shift, 0, CM_DIM); y_end_ris = np.clip(map_y_center_ris + shift + 1, 0, CM_DIM)
+        x_start_ris = np.clip(ris_pos_2d_map[0] - shift, 0, CM_DIM); x_end_ris = np.clip(ris_pos_2d_map[0] + shift + 1, 0, CM_DIM)
+        ris_map_img[y_start_ris:y_end_ris, x_start_ris:x_end_ris] = 255
+
+    maps_to_save_dict = {"tx_map": tx_map_img.copy(), "rx_map": rx_map_img.copy(), "ris_map": ris_map_img.copy(), "power_map": tx_cm_processed.copy(), "city_map": city_map_img.copy()}
     paths_data_dict = {}
 
     for map_type_str, map_image_data in maps_to_save_dict.items():

@@ -362,6 +362,73 @@ class PMNetFiLMNew(nn.Module):
         return xup00
     
 
+class PMNetFilMModified(nn.Module):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=8, use_film=True):
+        super(PMNetFilMModified, self).__init__()
+
+        # --- Stride Config ---
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        self.use_film = use_film
+        if use_film:
+            self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+            self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+
+        # --- Encoder Configuration ---
+        # ch = [64, 128, 256, 512, 1024, 2048]
+        ch = [64 * 2 ** p for p in range(6)]
+        
+        self.layer1 = _Stem(ch[0], in_ch=3)  # Output: 64 channels (x1)
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0]) # Output: 256 channels (x2)
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1) # Output: 256 channels (x3)
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1]) # Output: 512 channels (x4)
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2]) # Output: 512 channels (x5)
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids) # Output: 1024 channels (x6)
+        
+        self.aspp = _ASPP(ch[4], 256, atrous_rates) # Output: 256 channels (x7)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1) # Output: 512 channels (x8)
+
+        # --- Decoder Configuration (Fixed Channels) ---
+        
+        self.head = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+    def forward(self, x, vec=None):
+        # Encoder
+        x1 = self.layer1(x)       # [B, 64, H/2, W/2]
+        x2 = self.layer2(x1)      # [B, 256, H/4, W/4]
+        x3 = self.reduce(x2)      # [B, 256, H/4, W/4]
+        x4 = self.layer3(x3)      # [B, 512, H/8, W/8]
+        x5 = self.layer4(x4)      # [B, 512, H/8, W/8] (if stride=1)
+        x6 = self.layer5(x5)      # [B, 1024, H/8, W/8]
+        x7 = self.aspp(x6)        # [B, 256, H/8, W/8]
+        x8 = self.fc1(x7)         # [B, 512, H/8, W/8]
+
+        # FiLM
+        if self.use_film:
+            cond_out = self.conditioner(vec)
+            x8 = self.film(x8, cond_out)
+
+        # Decoder 
+        h = x8
+        h = F.adaptive_avg_pool2d(h, (10, 10))
+        out = self.head(h)   # small conv stack: 512->128->1
+        return out
+    
+
 class PMNet(nn.Module):
 
     def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride):
