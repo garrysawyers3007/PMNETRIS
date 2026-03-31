@@ -31,7 +31,7 @@ from network.pmnet import PMNet, PMNetFiLM
 from network.rismapnet import RISMapNet, RISMapNetConfig
 from config import config_USC_pmnetV3_V2, config_USC_RISMapNet_V1
 from dataloader import PMnet_data_usc
-from loss import L1_loss, MSE, RMSE, WeightedRMSELoss
+from loss import L1_loss, MSE, RMSE, WeightedRMSELoss, ris_gain_loss
 
 import random
 
@@ -56,27 +56,27 @@ def train(model, train_loader, test_loader, optimizer, scheduler, writer, cfg=No
     best_val = 100
     count = 0
 
-    weightedRMSE = WeightedRMSELoss(roi_size=48, roi_weight=10.0, non_roi_weight=1.0)
+    # weightedRMSE = WeightedRMSELoss(roi_size=48, roi_weight=10.0, non_roi_weight=1.0)
     # looping over given number of epochs
     for epoch in range(cfg.num_epochs):
         tic = time.time()
 
         model.train()
 
-        for inputs, ris_params, targets in tqdm(train_loader):
+        for inputs, ris_params, ris_polar, ris_rho_theta_phi, targets, noris_targets in tqdm(train_loader):
             count += 1
 
             inputs = inputs.cuda()
-            ris_params = ris_params.cuda()
+            ris_rho_theta_phi = ris_rho_theta_phi.cuda()
             targets = targets.cuda()
-            rx_params = ris_params[:, 6:9]
-            # Clip ris_params to exclude RX position (keep RIS pos, orientation, and flag)
-            ris_params_clipped = torch.cat([ris_params[:, :6], ris_params[:, 9:10]], dim=1)
+            noris_targets = noris_targets.cuda()
 
             optimizer.zero_grad()
-            # preds = model(inputs)
-            preds = model(inputs, ris_params_clipped)
-            loss = RMSE(preds, targets)
+            preds = model(inputs, ris_rho_theta_phi)
+            noris_cond = torch.zeros_like(ris_rho_theta_phi)
+            pred_noris = model(inputs, noris_cond)
+            loss = ris_gain_loss(preds, targets, pred_noris, noris_targets)
+            # loss = RMSE(preds, targets)
             # loss = weightedRMSE(preds, targets, rx_params)
 
             loss.backward()
@@ -92,7 +92,7 @@ def train(model, train_loader, test_loader, optimizer, scheduler, writer, cfg=No
         print(f"lr: {optimizer.param_groups[0]['lr']} at epoch {epoch}")
         scheduler.step()
         if epoch%cfg.val_freq==0:
-          val_loss, best_val = eval_model(model, test_loader, error='RMSE', best_val=best_val, cfg=cfg)
+          val_loss, best_val = eval_model(model, test_loader, error='L1_loss', best_val=best_val, cfg=cfg)
           writer.add_scalar('Val/Loss', val_loss, count)
 
     return best_val
@@ -106,23 +106,14 @@ def eval_model(model, test_loader, error="RMSE", best_val=100, cfg=None, eval_mo
 
     # check dataset type
     pred_cnt=1 # start from 1
-    for inputs, ris_params, targets in tqdm(test_loader):
+    for inputs, ris_params, ris_polar, ris_rho_theta_phi, targets, noris_targets in tqdm(test_loader):
         inputs = inputs.cuda()
-        ris_params = ris_params.cuda()
+        ris_rho_theta_phi = ris_rho_theta_phi.cuda()
         targets = targets.cuda()
-        # Clip ris_params to exclude RX position (keep RIS pos, orientation, and flag)
-        ris_params_clipped = torch.cat([ris_params[:, :6], ris_params[:, 9:10]], dim=1)
+        noris_targets = noris_targets.cuda()
 
         with torch.set_grad_enabled(False):
-            if error == "MSE":
-                criterion = MSE
-            elif error == "RMSE":
-                criterion = RMSE
-            elif error == "L1_loss":
-                criterion = L1_loss
-
-            # preds = model(inputs)
-            preds = model(inputs, ris_params_clipped)
+            preds = model(inputs, ris_rho_theta_phi)
             preds = torch.clip(preds, 0, 1)
 
             # inference image
@@ -136,7 +127,12 @@ def eval_model(model, test_loader, error="RMSE", best_val=100, cfg=None, eval_mo
                     if pred_cnt%100==0:
                         print(f'{img_name} saved')
 
-            loss = criterion(preds, targets)
+            if error == "MSE":
+                loss = MSE(preds, targets)
+            elif error == "RMSE":
+                loss = RMSE(preds, targets)
+            elif error == "L1_loss":
+                loss = L1_loss(preds, targets)
             # NMSE
 
             avg_loss += (loss.item() * inputs.shape[0])

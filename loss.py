@@ -5,6 +5,24 @@ def L1_loss(pred, target):
   loss = nn.L1Loss()(pred, target)
   return loss
 
+def ris_gain_loss(pred, target, pred_noris, target_noris, lam=1.0):
+  """
+  Loss = L1(pred, target) + λ * | (pred - pred_noris) - (target - target_noris) |
+
+  Encourages the model to correctly predict both the absolute power map
+  and the incremental gain introduced by the RIS.
+
+  Args:
+      pred:         Predicted RIS power map.
+      target:       Ground-truth RIS power map.
+      pred_noris:   Predicted no-RIS power map.
+      target_noris: Ground-truth no-RIS power map.
+      lam:          Weight for the RIS-gain consistency term (default: 1.0).
+  """
+  l1 = nn.L1Loss()(pred, target)
+  gain_error = torch.mean(torch.abs((pred - pred_noris) - (target - target_noris)))
+  return l1 + lam * gain_error
+
 def MSE(pred, target):
   loss = nn.MSELoss()(pred, target)
   return loss

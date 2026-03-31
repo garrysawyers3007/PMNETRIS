@@ -248,8 +248,9 @@ class PMNetFiLM(nn.Module):
     
 
 class PMNetFiLMNew(nn.Module):
-    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=8):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=8, use_film=True):
         super(PMNetFiLMNew, self).__init__()
+        self.use_film = use_film
 
         # --- Stride Config ---
         if output_stride == 8:
@@ -259,8 +260,10 @@ class PMNetFiLMNew(nn.Module):
             s = [1, 2, 2, 1]
             d = [1, 1, 1, 2]
 
-        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
-        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        # Only initialize FiLM components if use_film is True
+        if self.use_film:
+            self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+            self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
 
         # --- Encoder Configuration ---
         # ch = [64, 128, 256, 512, 1024, 2048]
@@ -308,7 +311,7 @@ class PMNetFiLMNew(nn.Module):
             nn.Conv2d(64, 1, kernel_size=3, padding=1)
         )
 
-    def forward(self, x, vec):
+    def forward(self, x, vec=None):
         # Encoder
         x1 = self.layer1(x)       # [B, 64, H/2, W/2]
         x2 = self.layer2(x1)      # [B, 256, H/4, W/4]
@@ -320,8 +323,14 @@ class PMNetFiLMNew(nn.Module):
         x8 = self.fc1(x7)         # [B, 512, H/8, W/8]
 
         # FiLM
-        cond_out = self.conditioner(vec)
-        x8 = self.film(x8, cond_out)
+        if self.use_film:
+            if vec is None:
+                # If FiLM is enabled but no vector is provided, you might want to raise an error
+                # or just skip. Raising error ensures we don't silently fail.
+                raise ValueError("Model initialized with use_film=True, but no conditioning vector 'vec' provided in forward().")
+            
+            cond_out = self.conditioner(vec)
+            x8 = self.film(x8, cond_out)
 
         # Decoder (with Robust Interpolation)
         xup5 = self.conv_up5(x8)
@@ -360,10 +369,10 @@ class PMNetFiLMNew(nn.Module):
         xup00 = self.conv_up00(xup0)
 
         return xup00
-    
+
 
 class PMNetFilMModified(nn.Module):
-    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=8, use_film=True):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7):
         super(PMNetFilMModified, self).__init__()
 
         # --- Stride Config ---
@@ -373,11 +382,6 @@ class PMNetFilMModified(nn.Module):
         elif output_stride == 16:
             s = [1, 2, 2, 1]
             d = [1, 1, 1, 2]
-
-        self.use_film = use_film
-        if use_film:
-            self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
-            self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
 
         # --- Encoder Configuration ---
         # ch = [64, 128, 256, 512, 1024, 2048]
@@ -393,6 +397,9 @@ class PMNetFilMModified(nn.Module):
         self.aspp = _ASPP(ch[4], 256, atrous_rates) # Output: 256 channels (x7)
         concat_ch = 256 * (len(atrous_rates) + 2)
         self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1) # Output: 512 channels (x8)
+        
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
 
         # --- Decoder Configuration (Fixed Channels) ---
         
@@ -413,21 +420,236 @@ class PMNetFilMModified(nn.Module):
         x3 = self.reduce(x2)      # [B, 256, H/4, W/4]
         x4 = self.layer3(x3)      # [B, 512, H/8, W/8]
         x5 = self.layer4(x4)      # [B, 512, H/8, W/8] (if stride=1)
+
         x6 = self.layer5(x5)      # [B, 1024, H/8, W/8]
         x7 = self.aspp(x6)        # [B, 256, H/8, W/8]
         x8 = self.fc1(x7)         # [B, 512, H/8, W/8]
 
         # FiLM
-        if self.use_film:
-            cond_out = self.conditioner(vec)
-            x8 = self.film(x8, cond_out)
+        cond_out = self.conditioner(vec)
+        x8 = self.film(x8, cond_out)
 
         # Decoder 
         h = x8
         h = F.adaptive_avg_pool2d(h, (10, 10))
         out = self.head(h)   # small conv stack: 512->128->1
         return out
-    
+
+class SpatialBottleneckModulation(nn.Module):
+    """
+    Spatially adaptive bottleneck modulation.
+
+    Inputs:
+      x   : [B, C, H, W]   bottleneck feature map
+      vec : [B, D]         conditioning vector
+
+    Process:
+      1. vec -> conditioner -> cond_embed [B, E]
+      2. broadcast cond_embed to [B, E, H, W]
+      3. concatenate with x
+      4. fuse using convs
+      5. predict spatial gamma/beta: [B, C, H, W]
+      6. apply residual modulation: gamma * x + beta
+    """
+    def __init__(self, num_features, cond_features, cond_embed_dim=128, hidden_channels=256):
+        super().__init__()
+
+        self.conditioner = MLPConditioner(
+            in_features=cond_features,
+            hidden_dim=128,
+            out_features=cond_embed_dim
+        )
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(num_features + cond_embed_dim, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU()
+        )
+
+        self.gamma_layer = nn.Conv2d(hidden_channels, num_features, kernel_size=1)
+        self.beta_layer = nn.Conv2d(hidden_channels, num_features, kernel_size=1)
+
+    def forward(self, x, vec):
+        b, c, h, w = x.shape
+
+        cond = self.conditioner(vec)                    # [B, E]
+        cond = cond.unsqueeze(-1).unsqueeze(-1)        # [B, E, 1, 1]
+        cond = cond.expand(-1, -1, h, w)               # [B, E, H, W]
+
+        fused = torch.cat([x, cond], dim=1)            # [B, C+E, H, W]
+        fused = self.fuse(fused)                       # [B, hidden, H, W]
+
+        gamma = self.gamma_layer(fused)                # [B, C, H, W]
+        beta = self.beta_layer(fused)                  # [B, C, H, W]
+
+        # Residual-style modulation
+        out = gamma * x + beta
+        return out
+
+
+class PMNetSpatialFiLM(nn.Module):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7):
+        super(PMNetSpatialFiLM, self).__init__()
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+
+        ch = [64 * 2 ** p for p in range(6)]
+
+        self.layer1 = _Stem(ch[0], in_ch=3)
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1)
+
+        self.film = SpatialBottleneckModulation(
+                num_features=512,
+                cond_features=cond_features,
+                cond_embed_dim=128,
+                hidden_channels=256
+            )
+
+        self.head = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+
+    def forward(self, x, vec=None):
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        x8 = self.film(x8, vec)
+
+        h = F.adaptive_avg_pool2d(x8, (10, 10))
+        out = self.head(h)
+        return out
+
+class PMNetBaseline(nn.Module):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride):
+        super(PMNetBaseline, self).__init__()
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+
+        ch = [64 * 2 ** p for p in range(6)]
+
+        self.layer1 = _Stem(ch[0], in_ch=3)
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1)
+
+        self.head = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+
+    def forward(self, x):
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        h = F.adaptive_avg_pool2d(x8, (10, 10))
+        out = self.head(h)
+        return out
+
+class PMNet4Ch(nn.Module):
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride):
+        super(PMNet4Ch, self).__init__()
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        ch = [64 * 2 ** p for p in range(6)]
+
+        self.layer1 = _Stem(ch[0], in_ch=4)
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.fc1 = _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1)
+
+        self.head = nn.Sequential(
+            nn.Conv2d(512, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+    def forward(self, x):
+        x1 = self.layer1(x)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        h = F.adaptive_avg_pool2d(x8, (10, 10))
+        out = self.head(h)
+        return out
+
 
 class PMNet(nn.Module):
 
@@ -499,3 +721,309 @@ class PMNet(nn.Module):
         xup00 = self.conv_up00(xup0)
         
         return xup00
+
+
+class PMNetFiLMCrop(nn.Module):
+    """
+    PMNet backbone with FiLM modulation at the bottleneck.
+    Produces a 10x10 crop of the full-resolution output centered at the
+    provided RX pixel coordinate.
+
+    Args:
+        n_blocks      : list of 4 ints  — ResLayer block counts
+        atrous_rates  : list of ints    — ASPP dilation rates
+        multi_grids   : list of ints    — multi-grid for layer5
+        output_stride : int             — 8 or 16
+        cond_features : int             — length of the FiLM conditioning vector
+
+    Forward:
+        x   : [B, 3, H, W]  — stacked input maps: [city_map, tx_map, rx_map]
+        vec : [B, cond_features]  — conditioning vector
+
+    Returns:
+        [B, 1, 10, 10]  — cropped power map patch centred on the RX position
+                          derived from channel 2 (rx_map) via centre-of-mass
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7,
+                 backbone_checkpoint=None):
+        super(PMNetFiLMCrop, self).__init__()
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # FiLM components
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+
+        # Encoder  (identical to PMNet, 3-channel input: city_map, tx_map, rx_map)
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # Decoder  (identical to PMNet)
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+        self.conv_up00 = nn.Sequential(
+            nn.Conv2d(128 + 2, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+        )
+
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            film_keys = {"conditioner", "film"}
+            non_film_missing = [k for k in missing if k.split(".")[0] not in film_keys]
+            if non_film_missing:
+                print(f"PMNetFiLMCrop: backbone keys not found in checkpoint: {non_film_missing}")
+            if unexpected:
+                print(f"PMNetFiLMCrop: checkpoint keys not in model (ignored): {unexpected}")
+
+    def forward(self, x, vec):
+        # x: [B, 3, H, W] — channels: city_map, tx_map, rx_map
+        # Only city_map and tx_map are fed to the encoder/decoder;
+        # rx_map (channel 2) is used only to derive the crop centre.
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # Encoder
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        # FiLM modulation at the bottleneck
+
+        cond_out = self.conditioner(vec)   # [B, 64]
+        x8 = self.film(x8, cond_out)      # [B, 512, h, w]
+
+        # Decoder
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:], mode="bilinear", align_corners=False)
+        xup0 = torch.cat([xup0, x_enc], dim=1)
+        full_output = self.conv_up00(xup0)  # [B, 1, H, W]
+
+        rx_pixel = self._extract_rx_center(x[:, 2])  # derive from rx_map channel
+        return self._crop_at_rx(full_output, rx_pixel, crop_size=14)
+
+    @staticmethod
+    def _extract_rx_center(rx_map):
+        """
+        Computes the centre-of-mass of the RX marker in rx_map.
+
+        Args:
+            rx_map : [B, H, W]  — single-channel RX map (white square on black)
+
+        Returns:
+            [B, 2] long tensor of (row, col) pixel coordinates
+        """
+        B, H, W = rx_map.shape
+        # Use float mask; the marker is non-zero where the RX box is drawn
+        mask = rx_map.float()  # [B, H, W]
+        total = mask.sum(dim=(1, 2)).clamp(min=1.0)  # [B]
+
+        row_idx = torch.arange(H, device=rx_map.device).float()  # [H]
+        col_idx = torch.arange(W, device=rx_map.device).float()  # [W]
+
+        row_center = (mask * row_idx.view(1, H, 1)).sum(dim=(1, 2)) / total  # [B]
+        col_center = (mask * col_idx.view(1, 1, W)).sum(dim=(1, 2)) / total  # [B]
+
+        return torch.stack([row_center, col_center], dim=1).round().long()  # [B, 2]
+
+    @staticmethod
+    def _crop_at_rx(feature_map, rx_pixel, crop_size=10):
+        """
+        Crops a (crop_size x crop_size) patch from feature_map centred at each
+        per-sample RX pixel coordinate.
+
+        Boundary handling: zero-pad the map by half=crop_size//2 on all sides so
+        that the crop is always exactly centred on rx_pixel, regardless of how
+        close it is to the border.
+
+        Args:
+            feature_map : [B, C, H, W]
+            rx_pixel    : [B, 2]  integer (row, col) in the original map
+            crop_size   : int (must be even)
+
+        Returns:
+            [B, C, crop_size, crop_size]
+        """
+        half = crop_size // 2
+        # Pad: left, right, top, bottom  (F.pad order is last-dim first)
+        padded = F.pad(feature_map, [half, half, half, half])  # [B, C, H+cs, W+cs]
+
+        crops = []
+        for b in range(feature_map.shape[0]):
+            r = int(rx_pixel[b, 0].item()) + half   # position of RX in padded image
+            c = int(rx_pixel[b, 1].item()) + half
+            crops.append(padded[b:b+1, :, r - half : r + half, c - half : c + half])
+
+        return torch.cat(crops, dim=0)  # [B, C, crop_size, crop_size]
+
+
+class PMNetFiLMSoftCrop(nn.Module):
+    """
+    PMNet backbone with FiLM modulation at the bottleneck.
+    Crops a 32x32 patch centred at the RX position (derived from rx_map via
+    centre-of-mass) then refines it to a 10x10 output through a learned roi_head.
+
+    Args:
+        n_blocks      : list of 4 ints  — ResLayer block counts
+        atrous_rates  : list of ints    — ASPP dilation rates
+        multi_grids   : list of ints    — multi-grid for layer5
+        output_stride : int             — 8 or 16
+        cond_features : int             — length of the FiLM conditioning vector
+        backbone_checkpoint : str|None  — path to a pre-trained PMNet checkpoint
+
+    Forward:
+        x   : [B, 3, H, W]  — stacked input maps: [city_map, tx_map, rx_map]
+        vec : [B, cond_features]  — conditioning vector
+
+    Returns:
+        [B, 1, 10, 10]  — refined power map patch centred on the RX position
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7,
+                 backbone_checkpoint=None):
+        super(PMNetFiLMSoftCrop, self).__init__()
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # FiLM components
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+
+        # Encoder  (2-channel input: city_map, tx_map)
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # Decoder  (identical to PMNet)
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+        self.conv_up00 = nn.Sequential(
+            nn.Conv2d(128 + 2, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+        )
+
+        # RoI refinement head: 32x32 crop -> 10x10 output
+        self.roi_head = nn.Sequential(
+            nn.Conv2d(1, 128, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((10, 10)),
+            nn.Conv2d(64, 1, 1),
+        )
+
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            new_keys = {"conditioner", "film", "roi_head"}
+            non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            if non_new_missing:
+                print(f"PMNetFiLMSoftCrop: backbone keys not found in checkpoint: {non_new_missing}")
+            if unexpected:
+                print(f"PMNetFiLMSoftCrop: checkpoint keys not in model (ignored): {unexpected}")
+
+    def forward(self, x, vec):
+        # x: [B, 3, H, W] — channels: city_map, tx_map, rx_map
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # Encoder
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        # FiLM modulation at the bottleneck
+        cond_out = self.conditioner(vec)   # [B, 64]
+        x8 = self.film(x8, cond_out)      # [B, 512, h, w]
+
+        # Decoder
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:], mode="bilinear", align_corners=False)
+        xup0 = torch.cat([xup0, x_enc], dim=1)
+        full_output = self.conv_up00(xup0)  # [B, 1, H, W]
+
+        rx_pixel = PMNetFiLMCrop._extract_rx_center(x[:, 2])
+        crop32 = PMNetFiLMCrop._crop_at_rx(full_output, rx_pixel, crop_size=32)  # [B, 1, 32, 32]
+        return self.roi_head(crop32)  # [B, 1, 10, 10]
