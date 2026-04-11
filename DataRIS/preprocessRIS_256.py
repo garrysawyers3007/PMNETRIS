@@ -15,7 +15,6 @@ JSON_INPUT_FILE = "dataset_new_32x32.json"
 JSON_OUTPUT_FILE = f"{OUTPUT_ROOT}metadata.json"
 
 CM_DIM = 900  # Coverage map dimension (pixels)
-NEW_CM_DIM = 256
 CM_CELL_SIZE = (5.0, 5.0) # Cell size in meters
 TX_WIDTH = 8  # TX marker width in pixels
 FLOOR = -200 # Min power value (dB)
@@ -139,22 +138,21 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
 
     if cm.path_gain.shape[0] == 0:
         print(f"  Warning: No path gain data for {file_prefix_str}. Saving blank power map.")
-        tx_cm_processed = np.zeros((NEW_CM_DIM, NEW_CM_DIM), dtype=np.uint8)
+        tx_cm_processed = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
     else:
         tx_cm = 10.*np.log10(cm.path_gain[0].numpy())
         tx_cm[tx_cm==(-np.inf)] = -255
         tx_cm[tx_cm > 0] = 0
-        tx_cm = cv2.resize(tx_cm, (NEW_CM_DIM, NEW_CM_DIM))
+        tx_cm = cv2.resize(tx_cm, (CM_DIM, CM_DIM))
         tx_cm = cv2.flip(tx_cm, 0)
         tx_cm[tx_cm < FLOOR] = FLOOR
         tx_cm += 255
 
-        city_map_256 = cv2.resize(city_map_img, (NEW_CM_DIM, NEW_CM_DIM))
-        tx_cm[city_map_256 < 55] = 0  # building mask
+        tx_cm[city_map_img < 55] = 0  # building mask
 
         tx_cm_processed = np.clip(tx_cm.astype(np.uint8), 0, 255)
 
-    # Build marker maps at full CM_DIM then resize to NEW_CM_DIM
+    # Build marker maps at full CM_DIM
     shift = TX_WIDTH // 2
 
     tx_pos_2d_map = (tx_pos_xy_for_txmap[:2] + (CM_DIM // 2) + 50).astype(np.int16)
@@ -163,7 +161,6 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
     y_start = np.clip(map_y_center_tx - shift, 0, CM_DIM); y_end = np.clip(map_y_center_tx + shift + 1, 0, CM_DIM)
     x_start = np.clip(tx_pos_2d_map[0] - shift, 0, CM_DIM); x_end = np.clip(tx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
     tx_map_img[y_start:y_end, x_start:x_end] = 255
-    tx_map_img = cv2.resize(tx_map_img, (NEW_CM_DIM, NEW_CM_DIM))
 
     rx_map_img = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
     if is_ris_scenario and ris_info_dict:
@@ -180,7 +177,6 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
         y_start_rx = np.clip(map_y_center_rx - shift, 0, CM_DIM); y_end_rx = np.clip(map_y_center_rx + shift + 1, 0, CM_DIM)
         x_start_rx = np.clip(rx_pos_2d_map[0] - shift, 0, CM_DIM); x_end_rx = np.clip(rx_pos_2d_map[0] + shift + 1, 0, CM_DIM)
         rx_map_img[y_start_rx:y_end_rx, x_start_rx:x_end_rx] = 255
-    rx_map_img = cv2.resize(rx_map_img, (NEW_CM_DIM, NEW_CM_DIM))
 
     ris_map_img = np.zeros((CM_DIM, CM_DIM), dtype=np.uint8)
     if is_ris_scenario and ris_info_dict:
@@ -190,16 +186,13 @@ def process_and_save_maps(scene_to_use, tx_id_str, tx_pos_xy_for_txmap, city_map
         y_start_ris = np.clip(map_y_center_ris - shift, 0, CM_DIM); y_end_ris = np.clip(map_y_center_ris + shift + 1, 0, CM_DIM)
         x_start_ris = np.clip(ris_pos_2d_map[0] - shift, 0, CM_DIM); x_end_ris = np.clip(ris_pos_2d_map[0] + shift + 1, 0, CM_DIM)
         ris_map_img[y_start_ris:y_end_ris, x_start_ris:x_end_ris] = 255
-    ris_map_img = cv2.resize(ris_map_img, (NEW_CM_DIM, NEW_CM_DIM))
-
-    city_map_out = cv2.resize(city_map_img, (NEW_CM_DIM, NEW_CM_DIM))
 
     maps_to_save_dict = {
         "tx_map": tx_map_img,
         "rx_map": rx_map_img,
         "ris_map": ris_map_img,
         "power_map": tx_cm_processed,
-        "city_map": city_map_out,
+        "city_map": city_map_img,
     }
     paths_data_dict = {}
 

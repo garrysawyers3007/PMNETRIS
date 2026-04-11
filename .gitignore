@@ -10,4 +10,5 @@ eval_imgs/
 eval_imgs_1/
 PMNet_results/inference_images/
 pmnet/
+datasetGeoRIS_256/
 __pycache__/

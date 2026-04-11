@@ -89,12 +89,12 @@ class PMnet_data_usc(Dataset):
                     "rx_map_path": paths_dict["rx_map"][i],
                     "ris_map_path": paths_dict["ris_map"][i] if self.use_ris_map and "ris_map" in paths_dict else None,
                     "power_map_path": paths_dict["power_map"][i],
-                    "is_ris_present_flag": 0.0,
+                    "is_ris_present_flag": -1.0,
                     "ris_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
                     "ris_orientation_rpy_for_view": np.zeros(3, dtype=np.float32), # Default for noRIS
                     "rx_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
-                    "ris_pos_polar": np.zeros(9, dtype=np.float32), # Default for noRIS: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
-                    "ris_pos_rho_theta_phi": np.zeros(7, dtype=np.float32), # Default for noRIS: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
+                    "ris_pos_polar": np.array([0,0,0,0,0,0,0,0,-1], dtype=np.float32), # Default for noRIS: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
+                    "ris_pos_rho_theta_phi": np.array([0,0,0,0,0,0,-1], dtype=np.float32), # Default for noRIS: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
                     "noris_power_map_path": None
                 }
 
@@ -130,7 +130,7 @@ class PMnet_data_usc(Dataset):
                             specific_polar = augmented_polar_positions[i]
                             if isinstance(specific_polar, list) and len(specific_polar) == 5:
                                 data_point["ris_pos_polar"] = np.array(
-                                    [specific_polar[0] / 400.0] + specific_polar[1:] + list(specific_orientation) + [1.0],
+                                    [specific_polar[0] / 400.0] + specific_polar[1:] + [v / (np.pi) for v in specific_orientation] + [1.0],
                                     dtype=np.float32
                                 )
                             else:
@@ -143,7 +143,7 @@ class PMnet_data_usc(Dataset):
                             specific_rtp = augmented_rho_theta_phi_positions[i]
                             if isinstance(specific_rtp, list) and len(specific_rtp) == 3:
                                 data_point["ris_pos_rho_theta_phi"] = np.array(
-                                    [specific_rtp[0] / 400.0] + specific_rtp[1:] + list(specific_orientation) + [1.0],
+                                    [specific_rtp[0] / 400.0] + [v / np.pi for v in specific_rtp[1:]] + [v / (np.pi) for v in specific_orientation] + [1.0],
                                     dtype=np.float32
                                 )
                             else:
@@ -331,12 +331,12 @@ class PMnet_data_usc_256(Dataset):
                     "rx_map_path": paths_dict["rx_map"][i],
                     "ris_map_path": paths_dict["ris_map"][i] if self.use_ris_map and "ris_map" in paths_dict else None,
                     "power_map_path": paths_dict["power_map"][i],
-                    "is_ris_present_flag": 0.0,
+                    "is_ris_present_flag": -1.0,
                     "ris_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
                     "ris_orientation_rpy_for_view": np.zeros(3, dtype=np.float32), # Default for noRIS
                     "rx_pos_normalized": np.zeros(3, dtype=np.float32), # Default for noRIS
-                    "ris_pos_polar": np.zeros(9, dtype=np.float32), # Default for noRIS: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
-                    "ris_pos_rho_theta_phi": np.zeros(7, dtype=np.float32), # Default for noRIS: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
+                    "ris_pos_polar": np.array([0,0,0,0,0,0,0,0,-1], dtype=np.float32), # Default for noRIS: [rho/400, sin_theta, cos_theta, sin_phi, cos_phi, roll, pitch, yaw, is_ris_present_flag]
+                    "ris_pos_rho_theta_phi": np.array([0,0,0,0,0,0,-1], dtype=np.float32), # Default for noRIS: [rho/400, theta, phi, roll, pitch, yaw, is_ris_present_flag]
                     "noris_power_map_path": None
                 }
 
@@ -488,19 +488,109 @@ class PMnet_data_usc_256(Dataset):
         return inputs_tensor, ris_info_tensor, power_tensor
 
         
-# if __name__ == "__main__":
-#     # Example usage
-#     dataset = PMnet_data_usc(
-#         dir_dataset="datasetRIS/",
-#         ris_pos_min=[-400, -400, 0],
-#         ris_pos_max=[300, 400, 70]
-#     )
+
+class PMnet_data_ris_map(Dataset):
+    """Dataloader that returns (input_tensor, ris_map, ris_flag, power_tensor).
     
-#     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-#     len_dataset = len(dataset)
-#     for inputs, ris_params, targets in dataloader:
-#         print("Inputs shape:", inputs.shape)
-#         print("RIS Params shape:", ris_params.shape)
-#         print("Targets shape:", targets.shape)
-#         print("Length of dataset:", len_dataset)
-#         break  # Just to test the first batch
+    input_tensor: 3 channels (city_map, tx_map, rx_map) resized to 256x256.
+    ris_map: 1-channel RIS map resized to 256x256.
+    ris_flag: scalar tensor, 1.0 if RIS present, -1.0 otherwise.
+    power_tensor: 1-channel power map resized to 14x14.
+    """
+
+    def __init__(self,
+                 dir_dataset="",
+                 transform=transforms.Compose([
+                     transforms.ToTensor(),
+                     transforms.Resize((256, 256), antialias=True)
+                 ]),
+                 get_paths=False):
+
+        self.dir_dataset = dir_dataset
+        self.transform = transform
+        self.get_paths = get_paths
+        self.metadata_path = os.path.join(self.dir_dataset, "metadata_new_polar.json")
+
+        if not os.path.exists(self.metadata_path):
+            raise FileNotFoundError(f"metadata_new_polar.json not found at {self.metadata_path}")
+
+        with open(self.metadata_path, 'r') as f:
+            original_metadata_records = json.load(f)
+
+        self.metadata_records = self._process_metadata(original_metadata_records)
+
+    def __len__(self):
+        return len(self.metadata_records)
+
+    def _process_metadata(self, original_records):
+        processed_list = []
+        for record_idx, record in enumerate(original_records):
+            paths_dict = record.get("paths")
+            required_keys = ["city_map", "tx_map", "rx_map", "ris_map", "power_map"]
+            if not isinstance(paths_dict, dict) or not all(k in paths_dict for k in required_keys):
+                print(f"Warning: Record {record_idx} has missing or malformed 'paths' dictionary. Skipping.")
+                continue
+
+            num_augmentations = len(paths_dict["city_map"]) if paths_dict["city_map"] else 0
+            if num_augmentations == 0:
+                print(f"Warning: Record {record_idx} has no image paths. Skipping.")
+                continue
+
+            for i in range(num_augmentations):
+                if not all(len(paths_dict[k]) > i for k in required_keys):
+                    print(f"Warning: Missing map paths for augmentation {i} in record {record_idx}. Skipping.")
+                    continue
+
+                is_ris = 1.0 if record.get("type") == "RIS" else -1.0
+
+                processed_list.append({
+                    "tx_id": record.get("tx_id"),
+                    "type": record.get("type"),
+                    "city_map_path": paths_dict["city_map"][i],
+                    "tx_map_path": paths_dict["tx_map"][i],
+                    "rx_map_path": paths_dict["rx_map"][i],
+                    "ris_map_path": paths_dict["ris_map"][i],
+                    "power_map_path": paths_dict["power_map"][i],
+                    "is_ris_present_flag": is_ris,
+                })
+        return processed_list
+
+    def _load_grayscale(self, path):
+        img = np.asarray(io.imread(path))
+        if img.ndim == 3 and img.shape[-1] >= 3:
+            img = img[:, :, 0]
+        return img
+
+    def __getitem__(self, idx):
+        dp = self.metadata_records[idx]
+
+        try:
+            image_buildings = self._load_grayscale(dp["city_map_path"])
+            image_tx = self._load_grayscale(dp["tx_map_path"])
+            image_rx = self._load_grayscale(dp["rx_map_path"])
+            image_ris = self._load_grayscale(dp["ris_map_path"])
+            image_power = self._load_grayscale(dp["power_map_path"])
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Could not load image for data_point {idx} (path: {e.filename}). Error: {e}")
+
+        # 3-channel input: city_map, tx_map, rx_map
+        inputs_np = np.stack([image_buildings, image_tx, image_rx], axis=-1)
+
+        ris_flag = torch.tensor(dp["is_ris_present_flag"], dtype=torch.float32)
+
+        if self.transform:
+            inputs_tensor = self.transform(inputs_np).float()
+
+            _to_256 = transforms.Resize((256, 256), antialias=True)
+            ris_map_tensor = _to_256(transforms.ToTensor()(image_ris.astype(np.uint8))).float()
+
+            power_tensor = transforms.ToTensor()(image_power.astype(np.uint8)).float()
+        else:
+            inputs_tensor = torch.from_numpy(inputs_np).float()
+            ris_map_tensor = torch.from_numpy(image_ris).unsqueeze(0).float()
+            power_tensor = torch.from_numpy(image_power).unsqueeze(0).float()
+
+        if self.get_paths:
+            return inputs_tensor, ris_map_tensor, ris_flag, power_tensor, dp["city_map_path"], dp["tx_map_path"], dp["power_map_path"]
+
+        return inputs_tensor, ris_map_tensor, ris_flag, power_tensor

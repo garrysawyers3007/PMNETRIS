@@ -142,8 +142,9 @@ def eval_model(model, test_loader, error="RMSE", best_val=100, cfg=None, eval_mo
 
     if avg_loss < best_val and eval_mode==False:
         best_val = avg_loss
-        # save ckpt
-        torch.save(model.state_dict(), f'{RESULT_FOLDER}/{cfg.exp_name}_epoch{cfg.num_epochs}/{cfg.param_str}/model_{best_val:.5f}.pt')
+        # save ckpt (unwrap DataParallel if needed)
+        state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        torch.save(state_dict, f'{RESULT_FOLDER}/{cfg.exp_name}_epoch{cfg.num_epochs}/{cfg.param_str}/model_{best_val:.5f}.pt')
         print(f'[*] model saved to: {RESULT_FOLDER}/{cfg.exp_name}_epoch{cfg.num_epochs}/{cfg.param_str}/model_{best_val:.5f}.pt')
         f_log.write(f'[*] model saved to: {RESULT_FOLDER}/{cfg.exp_name}_epoch{cfg.num_epochs}/{cfg.param_str}/model_{best_val:.5f}.pt')
         f_log.write('\n')
@@ -210,6 +211,11 @@ def helper(cfg, writer, data_root = '', load_model=''):
     if load_model:
         model.load_state_dict(torch.load(load_model))
         model.to(device)
+
+    # Multi-GPU support
+    # if torch.cuda.device_count() > 1:
+    #     print(f'[*] Using {torch.cuda.device_count()} GPUs')
+    #     model = nn.DataParallel(model)
 
     # print(summary_(model,  (2, 256, 256),batch_size=cfg.batch_size))
 

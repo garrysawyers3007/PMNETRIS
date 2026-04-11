@@ -869,7 +869,7 @@ class PMNetFiLMCrop(nn.Module):
         return torch.stack([row_center, col_center], dim=1).round().long()  # [B, 2]
 
     @staticmethod
-    def _crop_at_rx(feature_map, rx_pixel, crop_size=10):
+    def _crop_at_rx(feature_map, rx_pixel, crop_size=14):
         """
         Crops a (crop_size x crop_size) patch from feature_map centred at each
         per-sample RX pixel coordinate.
@@ -955,21 +955,13 @@ class PMNetFiLMSoftCrop(nn.Module):
         self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
         self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
         self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
-        self.conv_up00 = nn.Sequential(
-            nn.Conv2d(128 + 2, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1),
-        )
-
-        # RoI refinement head: 32x32 crop -> 10x10 output
+        # RoI refinement head: 32x32 crop from xup0 (128ch) -> 10x10 output
         self.roi_head = nn.Sequential(
-            nn.Conv2d(1, 128, 3, padding=1),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(),
             nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.AdaptiveAvgPool2d((10, 10)),
             nn.Conv2d(64, 1, 1),
@@ -983,11 +975,13 @@ class PMNetFiLMSoftCrop(nn.Module):
                 state_dict = ckpt
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             new_keys = {"conditioner", "film", "roi_head"}
+            removed_keys = {"conv_up00"}
             non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            unexpected_real = [k for k in unexpected if k.split(".")[0] not in removed_keys]
             if non_new_missing:
                 print(f"PMNetFiLMSoftCrop: backbone keys not found in checkpoint: {non_new_missing}")
-            if unexpected:
-                print(f"PMNetFiLMSoftCrop: checkpoint keys not in model (ignored): {unexpected}")
+            if unexpected_real:
+                print(f"PMNetFiLMSoftCrop: checkpoint keys not in model (ignored): {unexpected_real}")
 
     def forward(self, x, vec):
         # x: [B, 3, H, W] — channels: city_map, tx_map, rx_map
@@ -1021,9 +1015,804 @@ class PMNetFiLMSoftCrop(nn.Module):
         xup0 = self.conv_up0(xup1)
 
         xup0 = F.interpolate(xup0, size=x_enc.shape[2:], mode="bilinear", align_corners=False)
-        xup0 = torch.cat([xup0, x_enc], dim=1)
-        full_output = self.conv_up00(xup0)  # [B, 1, H, W]
 
         rx_pixel = PMNetFiLMCrop._extract_rx_center(x[:, 2])
-        crop32 = PMNetFiLMCrop._crop_at_rx(full_output, rx_pixel, crop_size=32)  # [B, 1, 32, 32]
+        crop32 = PMNetFiLMCrop._crop_at_rx(xup0, rx_pixel, crop_size=32)  # [B, 128, 32, 32]
         return self.roi_head(crop32)  # [B, 1, 10, 10]
+
+class PMNetFiLMSoftCropV2(nn.Module):
+    """
+    PMNet backbone with FiLM modulation at the bottleneck.
+    Crops a 32x32 patch centred at the RX position (derived from rx_map via
+    centre-of-mass) then refines it to a 10x10 output through a learned roi_head.
+
+    Args:
+        n_blocks      : list of 4 ints  — ResLayer block counts
+        atrous_rates  : list of ints    — ASPP dilation rates
+        multi_grids   : list of ints    — multi-grid for layer5
+        output_stride : int             — 8 or 16
+        cond_features : int             — length of the FiLM conditioning vector
+        backbone_checkpoint : str|None  — path to a pre-trained PMNet checkpoint
+
+    Forward:
+        x   : [B, 3, H, W]  — stacked input maps: [city_map, tx_map, rx_map]
+        vec : [B, cond_features]  — conditioning vector
+
+    Returns:
+        [B, 1, 10, 10]  — refined power map patch centred on the RX position
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7, sigma=32.0, crop_size=32,
+                 backbone_checkpoint=None):
+        super(PMNetFiLMSoftCropV2, self).__init__()
+        self.crop_size = crop_size
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # FiLM components
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+
+        # Encoder  (2-channel input: city_map, tx_map)
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # Decoder  (identical to PMNet)
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+        # # RoI refinement head: 32x32 crop from xup0 (128ch) -> 10x10 output
+
+        self.roi_head = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((10, 10)),
+            nn.Conv2d(64, 1, 1),
+        )
+
+        self.sigma = sigma
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            new_keys = {"conditioner", "film", "roi_head"}
+            removed_keys = {"conv_up00"}
+            non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            unexpected_real = [k for k in unexpected if k.split(".")[0] not in removed_keys]
+            if non_new_missing:
+                print(f"PMNetFiLMSoftCrop: backbone keys not found in checkpoint: {non_new_missing}")
+            if unexpected_real:
+                print(f"PMNetFiLMSoftCrop: checkpoint keys not in model (ignored): {unexpected_real}")
+
+    def forward(self, x, vec):
+        # x: [B, 3, H, W] — channels: city_map, tx_map, rx_map
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # Encoder
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        # FiLM modulation at the bottleneck
+        cond_out = self.conditioner(vec)   # [B, 64]
+        x8 = self.film(x8, cond_out)      # [B, 512, h, w]
+
+        # Decoder
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:], mode="bilinear", align_corners=False)
+
+        rx_pixel = self._extract_rx_center_differentiable(x[:, 2])
+        gate = self.make_rx_gaussian(rx_pixel, xup0.shape[-2], xup0.shape[-1], sigma=self.sigma)
+        xup0_gated = xup0 * gate
+        crop_gated = self._crop_at_rx_differentiable(xup0_gated, rx_pixel, crop_size=self.crop_size)
+        return self.roi_head(crop_gated)  # [B, 1, 10, 10]
+    
+    def make_rx_gaussian(self, rx_pixel, H, W, sigma):
+        """
+        Create a Gaussian attention map centered at RX.
+
+        Args:
+            rx_pixel : [B, 2] tensor with (y, x) coordinates
+            H, W     : spatial size
+            sigma    : std deviation (controls spread)
+
+        Returns:
+            gate     : [B, 1, H, W]
+        """
+        device = rx_pixel.device
+        B = rx_pixel.shape[0]
+
+        # Create coordinate grid
+        y_coords = torch.arange(H, device=device).view(1, H, 1).expand(B, H, W)
+        x_coords = torch.arange(W, device=device).view(1, 1, W).expand(B, H, W)
+
+        # RX center
+        cy = rx_pixel[:, 0].view(B, 1, 1)
+        cx = rx_pixel[:, 1].view(B, 1, 1)
+
+        # Squared distance
+        dist_sq = (y_coords - cy) ** 2 + (x_coords - cx) ** 2
+
+        # Gaussian
+        gate = torch.exp(-dist_sq / (2 * sigma ** 2))
+
+        return gate.unsqueeze(1)  # [B, 1, H, W]
+
+    def _extract_rx_center_differentiable(self, rx_map, beta=50.0):
+        """
+        Differentiable centre-of-mass via spatial softmax.
+        Returns float coordinates that carry gradients (no .round().long()).
+
+        Args:
+            rx_map : [B, H, W] or [B, 1, H, W]
+            beta   : softmax temperature — higher → closer to argmax
+
+        Returns:
+            [B, 2] float tensor of (row, col) coordinates
+        """
+        if rx_map.dim() == 3:
+            rx_map = rx_map.unsqueeze(1)
+        B, _, H, W = rx_map.shape
+        device = rx_map.device
+
+        weights = F.softmax(rx_map.view(B, -1) * beta, dim=-1).view(B, H, W)
+
+        grid_y = torch.arange(H, device=device).float().view(1, H, 1)
+        grid_x = torch.arange(W, device=device).float().view(1, 1, W)
+
+        cy = (weights * grid_y).sum(dim=(1, 2))  # [B]
+        cx = (weights * grid_x).sum(dim=(1, 2))  # [B]
+
+        return torch.stack([cy, cx], dim=1)  # [B, 2]
+
+    def _crop_at_rx_differentiable(self, feature_map, rx_pixel, crop_size=32):
+        """
+        Differentiable crop centred at rx_pixel using F.grid_sample.
+
+        Args:
+            feature_map : [B, C, H, W]
+            rx_pixel    : [B, 2] floats (row, col) — carries gradients
+            crop_size   : int — output spatial size
+
+        Returns:
+            [B, C, crop_size, crop_size]
+        """
+        B, C, H, W = feature_map.shape
+        device = feature_map.device
+
+        # Normalise RX centre to [-1, 1] (grid_sample convention)
+        norm_y = (rx_pixel[:, 0] / (H - 1)) * 2 - 1  # [B]
+        norm_x = (rx_pixel[:, 1] / (W - 1)) * 2 - 1  # [B]
+
+        # Local grid spanning crop_size pixels, scaled to fraction of full map
+        side = torch.linspace(-1, 1, crop_size, device=device)
+        mesh_y, mesh_x = torch.meshgrid(side * (crop_size / H), side * (crop_size / W), indexing='ij')
+        grid_base = torch.stack([mesh_x, mesh_y], dim=-1).unsqueeze(0)  # [1, cs, cs, 2]
+
+        # Shift to RX position — addition propagates grads through norm_x/norm_y
+        offset = torch.stack([norm_x, norm_y], dim=-1).view(B, 1, 1, 2)
+        grid = grid_base + offset  # [B, cs, cs, 2]
+
+        return F.grid_sample(feature_map, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=True)
+
+class PMNetFiLMSoftCropV3(nn.Module):
+    """
+    PMNet backbone with FiLM modulation at the bottleneck.
+    Applies a Gaussian attention gate centred at the RX position (derived from
+    rx_map via centre-of-mass) to the full-resolution decoder feature map
+    (xup0, 128ch), then downsamples to a 10x10 output via a strided-conv
+    roi_head. No explicit crop is performed; the Gaussian gate suppresses
+    activations far from the RX location.
+
+    Args:
+        n_blocks      : list of 4 ints  — ResLayer block counts
+        atrous_rates  : list of ints    — ASPP dilation rates
+        multi_grids   : list of ints    — multi-grid for layer5
+        output_stride : int             — 8 or 16
+        cond_features : int             — length of the FiLM conditioning vector
+        sigma         : float           — std deviation of the RX Gaussian gate
+        crop_size     : int             — unused; retained for API compatibility
+        backbone_checkpoint : str|None  — path to a pre-trained PMNet checkpoint
+
+    Forward:
+        x   : [B, 3, H, W]  — stacked input maps: [city_map, tx_map, rx_map]
+        vec : [B, cond_features]  — conditioning vector
+
+    Returns:
+        [B, 1, 10, 10]  — power map prediction centred on the RX position
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride, cond_features=7, sigma=64.0, crop_size=32,
+                 backbone_checkpoint=None):
+        super(PMNetFiLMSoftCropV3, self).__init__()
+        self.crop_size = crop_size
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # FiLM components
+        self.conditioner = MLPConditioner(in_features=cond_features, out_features=64)
+        self.film = FiLMModulation(num_features=512, mlp_output_dim=64)
+
+        # Encoder  (2-channel input: city_map, tx_map)
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # Decoder  (identical to PMNet)
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+        # RoI refinement head: 32x32 crop from xup0 (128ch) -> 10x10 output
+        self.roi_head = nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 128, 3, stride=2, padding=1),   # 256 -> 128
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 96, 3, stride=2, padding=1),    # 128 -> 64
+            nn.BatchNorm2d(96),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(96, 64, 3, stride=2, padding=1),     # 64 -> 32
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 64, 3, stride=2, padding=1),     # 32 -> 16
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.AdaptiveAvgPool2d((10, 10)),
+            nn.Conv2d(64, 1, 1)
+        )
+
+        self.sigma = sigma
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            new_keys = {"conditioner", "film", "roi_head"}
+            removed_keys = {"conv_up00"}
+            non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            unexpected_real = [k for k in unexpected if k.split(".")[0] not in removed_keys]
+            if non_new_missing:
+                print(f"PMNetFiLMSoftCrop: backbone keys not found in checkpoint: {non_new_missing}")
+            if unexpected_real:
+                print(f"PMNetFiLMSoftCrop: checkpoint keys not in model (ignored): {unexpected_real}")
+
+    def forward(self, x, vec):
+        # x: [B, 3, H, W] — channels: city_map, tx_map, rx_map
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # Encoder
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)
+
+        # FiLM modulation at the bottleneck
+        cond_out = self.conditioner(vec)   # [B, 64]
+        x8 = self.film(x8, cond_out)      # [B, 512, h, w]
+
+        # Decoder
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:], mode="bilinear", align_corners=False)
+
+        rx_pixel = PMNetFiLMCrop._extract_rx_center(x[:, 2])
+        gate = self.make_rx_gaussian(rx_pixel, xup0.shape[-2], xup0.shape[-1], sigma=self.sigma)
+        xup0_gated = xup0 * gate
+
+        return self.roi_head(xup0_gated) # [B, 1, 10, 10]
+    
+    def make_rx_gaussian(self, rx_pixel, H, W, sigma):
+        """
+        Create a Gaussian attention map centered at RX.
+
+        Args:
+            rx_pixel : [B, 2] tensor with (y, x) coordinates
+            H, W     : spatial size
+            sigma    : std deviation (controls spread)
+
+        Returns:
+            gate     : [B, 1, H, W]
+        """
+        device = rx_pixel.device
+        B = rx_pixel.shape[0]
+
+        # Create coordinate grid
+        y_coords = torch.arange(H, device=device).view(1, H, 1).expand(B, H, W)
+        x_coords = torch.arange(W, device=device).view(1, 1, W).expand(B, H, W)
+
+        # RX center
+        cy = rx_pixel[:, 0].view(B, 1, 1)
+        cx = rx_pixel[:, 1].view(B, 1, 1)
+
+        # Squared distance
+        dist_sq = (y_coords - cy) ** 2 + (x_coords - cx) ** 2
+
+        # Gaussian
+        gate = torch.exp(-dist_sq / (2 * sigma ** 2))
+
+        return gate.unsqueeze(1)  # [B, 1, H, W]
+
+class GeometryEncoder(nn.Module):
+    """Small CNN that encodes 3-channel spatial geometry input
+    [tx_map, ris_map, rx_map] down to a feature map matching the
+    encoder bottleneck spatial resolution.
+
+    256×256 → 128×128 (stride 2) → 64×64 (stride 2) → 64×64 (stride 1)
+    """
+
+    def __init__(self, in_ch=3, out_ch=128):
+        super().__init__()
+        # self.net = nn.Sequential(
+        #     nn.Conv2d(in_ch, 32, kernel_size=3, stride=2, padding=1),
+        #     nn.BatchNorm2d(32),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(64, out_ch, kernel_size=3, stride=1, padding=1),
+        #     nn.BatchNorm2d(out_ch),
+        #     nn.ReLU(inplace=True),
+        # )
+
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, 24, kernel_size=3, stride=2, padding=1),   # 256 -> 128
+            nn.BatchNorm2d(24),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1),      # 128 -> 64
+            nn.BatchNorm2d(48),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(48, out_ch, kernel_size=3, stride=1, padding=2, dilation=2),  # 64 -> 64
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PMNetFiLMSoftCropV4_1(nn.Module):
+    """PMNet with spatial geometry conditioning at the bottleneck.
+
+    Replaces the MLP+FiLM vector conditioning of V2 with a GeometryEncoder
+    CNN branch that processes spatial maps [tx_map, ris_map, rx_map] and
+    fuses with the encoder bottleneck via a zero-initialised residual
+    weighted-sum.  The pretrained encoder and decoder are unchanged.
+
+    Forward:
+        x       : [B, 3, H, W]  — [city_map, tx_map, rx_map]
+        ris_map : [B, 1, H, W]  — RIS spatial map (zeros for noRIS)
+
+    Returns:
+        [B, 1, 10, 10]  — power map patch centred on the RX position
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride,
+                 sigma=32.0, crop_size=32, backbone_checkpoint=None):
+        super(PMNetFiLMSoftCropV4_1, self).__init__()
+        self.crop_size = crop_size
+        self.sigma = sigma
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # —— Geometry conditioning branch (NEW) ——
+        # self.geom_encoder = GeometryEncoder(in_ch=3, out_ch=128)
+        self.geom_encoder = GeometryEncoder(in_ch=3, out_ch=96)
+        # self.geom_proj = nn.Sequential(
+        #     nn.Conv2d(128, 512, kernel_size=1),
+        #     nn.BatchNorm2d(512),
+        # )
+
+        self.geom_proj = nn.Sequential(
+            nn.Conv2d(96, 512, kernel_size=1),
+            nn.BatchNorm2d(512),
+        )
+        # Fuse encoder bottleneck (512) + geometry projection (512) → 512
+        self.fuse_1x1 = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+        )
+
+        # —— Encoder (2-channel: city_map + tx_map, unchanged from V2) ——
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # —— Decoder (unchanged from V2) ——
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+
+        # RoI refinement head: crop from xup0 (128ch) → 10×10 output
+        # self.roi_head = nn.Sequential(
+        #     nn.Conv2d(256, 128, 3, padding=1),
+        #     nn.BatchNorm2d(128),
+        #     nn.ReLU(),
+        #     nn.Conv2d(128, 64, 3, padding=1),
+        #     nn.BatchNorm2d(64),
+        #     nn.ReLU(),
+        #     nn.AdaptiveAvgPool2d((10, 10)),
+        #     nn.Conv2d(64, 1, 1),
+        # )
+
+        self.roi_head = nn.Sequential(
+            nn.Conv2d(256, 96, 3, padding=1),
+            nn.BatchNorm2d(96),
+            nn.ReLU(),
+            nn.Conv2d(96, 48, 3, padding=1),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((10, 10)),
+            nn.Conv2d(48, 1, 1),
+        )
+
+        # —— Optional pretrained backbone loading ——
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            new_keys = {"geom_encoder", "geom_proj", "fuse_1x1", "roi_head"}
+            removed_keys = {"conv_up00", "conditioner", "film"}
+            non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            unexpected_real = [k for k in unexpected if k.split(".")[0] not in removed_keys]
+            if non_new_missing:
+                print(f"PMNetFiLMSoftCropV4: backbone keys not found in checkpoint: {non_new_missing}")
+            if unexpected_real:
+                print(f"PMNetFiLMSoftCropV4: checkpoint keys not in model (ignored): {unexpected_real}")
+
+    def forward(self, x, ris_map):
+        # x: [B, 3, H, W] — [city_map, tx_map, rx_map]
+        # ris_map: [B, 1, H, W] — RIS spatial map (zeros for noRIS)
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # —— Encoder ——
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)  # [B, 512, h, w]
+
+        # —— Geometry conditioning (replaces FiLM) ——
+        geom_input = torch.cat([x[:, 1:2], ris_map, x[:, 2:3]], dim=1)  # [B, 3, H, W]
+        geom_feat = self.geom_encoder(geom_input)  # [B, 128, h', w']
+        # geom_feat = F.interpolate(geom_feat, size=x8.shape[2:],
+        #                           mode='bilinear', align_corners=False)
+        geom_feat = F.adaptive_max_pool2d(geom_feat, x8.shape[2:])
+        geom_proj = self.geom_proj(geom_feat)  # [B, 512, h, w]
+        fused = torch.cat([x8, geom_proj], dim=1)  # [B, 1024, h, w]
+        x8 = self.fuse_1x1(fused)  # [B, 512, h, w]
+
+        # —— Decoder ——
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:],
+                             mode="bilinear", align_corners=False)
+
+        # —— RX-centred crop + RoI head ——
+        rx_pixel = self._extract_rx_center_differentiable(x[:, 2])
+        gate = self._make_rx_gaussian(rx_pixel, xup0.shape[-2],
+                                      xup0.shape[-1], sigma=self.sigma)
+        xup0_gated = xup0 * gate
+
+        crop_gated = self._crop_at_rx_differentiable(
+            xup0_gated, rx_pixel, crop_size=self.crop_size)
+        crop_raw = self._crop_at_rx_differentiable(
+            xup0, rx_pixel, crop_size=self.crop_size)
+
+        roi_feat = torch.cat([crop_raw, crop_gated], dim=1)
+        return self.roi_head(roi_feat)  # [B, 1, 10, 10]
+
+    # —— Helpers (unchanged from V2) ——
+
+    @staticmethod
+    def _make_rx_gaussian(rx_pixel, H, W, sigma):
+        device = rx_pixel.device
+        B = rx_pixel.shape[0]
+        y_coords = torch.arange(H, device=device).float().view(1, H, 1).expand(B, H, W)
+        x_coords = torch.arange(W, device=device).float().view(1, 1, W).expand(B, H, W)
+        cy = rx_pixel[:, 0].view(B, 1, 1)
+        cx = rx_pixel[:, 1].view(B, 1, 1)
+        dist_sq = (y_coords - cy) ** 2 + (x_coords - cx) ** 2
+        gate = torch.exp(-dist_sq / (2 * sigma ** 2))
+        return gate.unsqueeze(1)  # [B, 1, H, W]
+
+    @staticmethod
+    def _extract_rx_center_differentiable(rx_map, beta=50.0):
+        if rx_map.dim() == 3:
+            rx_map = rx_map.unsqueeze(1)
+        B, _, H, W = rx_map.shape
+        device = rx_map.device
+        weights = F.softmax(rx_map.view(B, -1) * beta, dim=-1).view(B, H, W)
+        grid_y = torch.arange(H, device=device).float().view(1, H, 1)
+        grid_x = torch.arange(W, device=device).float().view(1, 1, W)
+        cy = (weights * grid_y).sum(dim=(1, 2))
+        cx = (weights * grid_x).sum(dim=(1, 2))
+        return torch.stack([cy, cx], dim=1)  # [B, 2]
+
+    @staticmethod
+    def _crop_at_rx_differentiable(feature_map, rx_pixel, crop_size=32):
+        B, C, H, W = feature_map.shape
+        device = feature_map.device
+        norm_y = (rx_pixel[:, 0] / (H - 1)) * 2 - 1
+        norm_x = (rx_pixel[:, 1] / (W - 1)) * 2 - 1
+        side = torch.linspace(-1, 1, crop_size, device=device)
+        mesh_y, mesh_x = torch.meshgrid(
+            side * (crop_size / H), side * (crop_size / W), indexing='ij')
+        grid_base = torch.stack([mesh_x, mesh_y], dim=-1).unsqueeze(0)
+        offset = torch.stack([norm_x, norm_y], dim=-1).view(B, 1, 1, 2)
+        grid = grid_base + offset
+        return F.grid_sample(feature_map, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=True)
+
+
+class PMNetSoftCropBaseline(nn.Module):
+    """Baseline PMNet with RX-centred soft crop — no geometry conditioning.
+
+    Same encoder, decoder, Gaussian gating, differentiable crop, and roi_head
+    as PMNetFiLMSoftCropV4_1, but without the GeometryEncoder/fusion branch.
+
+    Forward:
+        x : [B, 3, H, W]  — [city_map, tx_map, rx_map]
+
+    Returns:
+        [B, 1, 10, 10]  — power map patch centred on the RX position
+    """
+
+    def __init__(self, n_blocks, atrous_rates, multi_grids, output_stride,
+                 sigma=32.0, crop_size=32, backbone_checkpoint=None):
+        super(PMNetSoftCropBaseline, self).__init__()
+        self.crop_size = crop_size
+        self.sigma = sigma
+
+        if output_stride == 8:
+            s = [1, 2, 1, 1]
+            d = [1, 1, 2, 4]
+        elif output_stride == 16:
+            s = [1, 2, 2, 1]
+            d = [1, 1, 1, 2]
+
+        # —— Encoder (2-channel: city_map + tx_map) ——
+        ch = [64 * 2 ** p for p in range(6)]
+        self.layer1 = _Stem(ch[0])
+        self.layer2 = _ResLayer(n_blocks[0], ch[0], ch[2], s[0], d[0])
+        self.layer3 = _ResLayer(n_blocks[1], ch[2], ch[3], s[1], d[1])
+        self.layer4 = _ResLayer(n_blocks[2], ch[3], ch[3], s[2], d[2])
+        self.layer5 = _ResLayer(n_blocks[3], ch[3], ch[4], s[3], d[3], multi_grids)
+        self.aspp = _ASPP(ch[4], 256, atrous_rates)
+        concat_ch = 256 * (len(atrous_rates) + 2)
+        self.add_module("fc1", _ConvBnReLU(concat_ch, 512, 1, 1, 0, 1))
+        self.reduce = _ConvBnReLU(256, 256, 1, 1, 0, 1)
+
+        # —— Decoder ——
+        self.conv_up5 = ConRu(512, 512, 3, 1)
+        self.conv_up4 = ConRu(512 + 512, 512, 3, 1)
+        self.conv_up3 = ConRuT(512 + 512, 256, 3, 1)
+        self.conv_up2 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up1 = ConRu(256 + 256, 256, 3, 1)
+        self.conv_up0 = ConRu(256 + 64, 128, 3, 1)
+
+        # RoI refinement head
+        self.roi_head = nn.Sequential(
+            nn.Conv2d(256, 128, 3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((10, 10)),
+            nn.Conv2d(64, 1, 1),
+        )
+
+        # —— Optional pretrained backbone loading ——
+        if backbone_checkpoint is not None:
+            ckpt = torch.load(backbone_checkpoint, map_location="cpu")
+            if isinstance(ckpt, dict):
+                state_dict = ckpt.get("model", ckpt.get("state_dict", ckpt))
+            else:
+                state_dict = ckpt
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            new_keys = {"roi_head"}
+            removed_keys = {"conv_up00", "conditioner", "film"}
+            non_new_missing = [k for k in missing if k.split(".")[0] not in new_keys]
+            unexpected_real = [k for k in unexpected if k.split(".")[0] not in removed_keys]
+            if non_new_missing:
+                print(f"PMNetSoftCropBaseline: backbone keys not found: {non_new_missing}")
+            if unexpected_real:
+                print(f"PMNetSoftCropBaseline: unexpected keys (ignored): {unexpected_real}")
+
+    def forward(self, x):
+        x_enc = x[:, :2]  # [B, 2, H, W]
+
+        # —— Encoder ——
+        x1 = self.layer1(x_enc)
+        x2 = self.layer2(x1)
+        x3 = self.reduce(x2)
+        x4 = self.layer3(x3)
+        x5 = self.layer4(x4)
+        x6 = self.layer5(x5)
+        x7 = self.aspp(x6)
+        x8 = self.fc1(x7)  # [B, 512, h, w]
+
+        # —— Decoder ——
+        xup5 = self.conv_up5(x8)
+        xup5 = torch.cat([xup5, x5], dim=1)
+        xup4 = self.conv_up4(xup5)
+        xup4 = torch.cat([xup4, x4], dim=1)
+        xup3 = self.conv_up3(xup4)
+        xup3 = torch.cat([xup3, x3], dim=1)
+        xup2 = self.conv_up2(xup3)
+        xup2 = torch.cat([xup2, x2], dim=1)
+        xup1 = self.conv_up1(xup2)
+        xup1 = torch.cat([xup1, x1], dim=1)
+        xup0 = self.conv_up0(xup1)
+
+        xup0 = F.interpolate(xup0, size=x_enc.shape[2:],
+                             mode="bilinear", align_corners=False)
+
+        # —— RX-centred crop + RoI head ——
+        rx_pixel = self._extract_rx_center_differentiable(x[:, 2])
+        gate = self._make_rx_gaussian(rx_pixel, xup0.shape[-2],
+                                      xup0.shape[-1], sigma=self.sigma)
+        xup0_gated = xup0 * gate
+
+        crop_gated = self._crop_at_rx_differentiable(
+            xup0_gated, rx_pixel, crop_size=self.crop_size)
+        crop_raw = self._crop_at_rx_differentiable(
+            xup0, rx_pixel, crop_size=self.crop_size)
+
+        roi_feat = torch.cat([crop_raw, crop_gated], dim=1)
+        return self.roi_head(roi_feat)  # [B, 1, 10, 10]
+
+    # —— Helpers ——
+
+    @staticmethod
+    def _make_rx_gaussian(rx_pixel, H, W, sigma):
+        device = rx_pixel.device
+        B = rx_pixel.shape[0]
+        y_coords = torch.arange(H, device=device).float().view(1, H, 1).expand(B, H, W)
+        x_coords = torch.arange(W, device=device).float().view(1, 1, W).expand(B, H, W)
+        cy = rx_pixel[:, 0].view(B, 1, 1)
+        cx = rx_pixel[:, 1].view(B, 1, 1)
+        dist_sq = (y_coords - cy) ** 2 + (x_coords - cx) ** 2
+        gate = torch.exp(-dist_sq / (2 * sigma ** 2))
+        return gate.unsqueeze(1)
+
+    @staticmethod
+    def _extract_rx_center_differentiable(rx_map, beta=50.0):
+        if rx_map.dim() == 3:
+            rx_map = rx_map.unsqueeze(1)
+        B, _, H, W = rx_map.shape
+        device = rx_map.device
+        weights = F.softmax(rx_map.view(B, -1) * beta, dim=-1).view(B, H, W)
+        grid_y = torch.arange(H, device=device).float().view(1, H, 1)
+        grid_x = torch.arange(W, device=device).float().view(1, 1, W)
+        cy = (weights * grid_y).sum(dim=(1, 2))
+        cx = (weights * grid_x).sum(dim=(1, 2))
+        return torch.stack([cy, cx], dim=1)
+
+    @staticmethod
+    def _crop_at_rx_differentiable(feature_map, rx_pixel, crop_size=32):
+        B, C, H, W = feature_map.shape
+        device = feature_map.device
+        norm_y = (rx_pixel[:, 0] / (H - 1)) * 2 - 1
+        norm_x = (rx_pixel[:, 1] / (W - 1)) * 2 - 1
+        side = torch.linspace(-1, 1, crop_size, device=device)
+        mesh_y, mesh_x = torch.meshgrid(
+            side * (crop_size / H), side * (crop_size / W), indexing='ij')
+        grid_base = torch.stack([mesh_x, mesh_y], dim=-1).unsqueeze(0)
+        offset = torch.stack([norm_x, norm_y], dim=-1).view(B, 1, 1, 2)
+        grid = grid_base + offset
+        return F.grid_sample(feature_map, grid, mode='bilinear',
+                             padding_mode='zeros', align_corners=True)
